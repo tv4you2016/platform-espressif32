@@ -28,6 +28,7 @@ import shutil
 import os
 from os.path import join
 import re
+import requests
 import platform as sys_platform
 
 import click
@@ -43,6 +44,7 @@ from platformio import fs, __version__
 from platformio.compat import IS_WINDOWS
 from platformio.proc import exec_command
 from platformio.builder.tools.piolib import ProjectAsLibBuilder
+from platformio.project.config import ProjectConfig
 from platformio.package.version import get_original_version, pepver_to_semver
 
 # Added to avoid conflicts between installed Python packages from
@@ -54,6 +56,64 @@ if os.environ.get("PYTHONPATH"):
 env = DefaultEnvironment()
 env.SConscript("_embed_files.py", exports="env")
 
+def install_standard_python_deps():
+    def _get_installed_standard_pip_packages():
+        result = {}
+        packages = {}
+        pip_output = subprocess.check_output(
+            [
+                env.subst("$PYTHONEXE"),
+                "-m",
+                "pip",
+                "list",
+                "--format=json",
+                "--disable-pip-version-check",
+            ]
+        )
+        try:
+            packages = json.loads(pip_output)
+        except:
+            print("Warning! Couldn't extract the list of installed Python packages.")
+            return {}
+        for p in packages:
+            result[p["name"]] = pepver_to_semver(p["version"])
+
+        return result
+
+    deps = {
+        "wheel": ">=0.35.1",
+        "PyYAML": ">=6.0.2"
+    }
+
+    installed_packages = _get_installed_standard_pip_packages()
+    packages_to_install = []
+    for package, spec in deps.items():
+        if package not in installed_packages:
+            packages_to_install.append(package)
+        else:
+            version_spec = semantic_version.Spec(spec)
+            if not version_spec.match(installed_packages[package]):
+                packages_to_install.append(package)
+
+    if packages_to_install:
+        env.Execute(
+            env.VerboseAction(
+                (
+                    '"$PYTHONEXE" -m pip install -U '
+                    + " ".join(
+                        [
+                            '"%s%s"' % (p, deps[p])
+                            for p in packages_to_install
+                        ]
+                    )
+                ),
+                "Installing standard Python dependencies",
+            )
+        )
+    return
+
+install_standard_python_deps()
+
 # Allow changes in folders of managed components
 os.environ["IDF_COMPONENT_OVERWRITE_MANAGED_COMPONENTS"] = "1"
 
@@ -61,6 +121,9 @@ platform = env.PioPlatform()
 config = env.GetProjectConfig()
 board = env.BoardConfig()
 mcu = board.get("build.mcu", "esp32")
+flash_speed = board.get("build.f_flash", "40000000L")
+flash_frequency = str(flash_speed.replace("000000L", "m"))
+flash_mode = board.get("build.flash_mode", "dio")
 idf_variant = mcu.lower()
 flag_custom_sdkonfig = False
 flag_custom_component_add = False
@@ -116,26 +179,80 @@ SDKCONFIG_PATH = os.path.expandvars(board.get(
 #
 # generate modified Arduino IDF sdkconfig, applying settings from "custom_sdkconfig"
 #
-if config.has_option("env:"+env["PIOENV"], "custom_sdkconfig"):
-    flag_custom_sdkonfig = True
-
 if config.has_option("env:"+env["PIOENV"], "custom_component_add"):
     flag_custom_component_add = True
-
 if config.has_option("env:"+env["PIOENV"], "custom_component_remove"):
     flag_custom_component_remove = True
-    
+
+if config.has_option("env:"+env["PIOENV"], "custom_sdkconfig"):
+    flag_custom_sdkonfig = True
+if "espidf.custom_sdkconfig" in board:
+    flag_custom_sdkonfig = True
 
 def HandleArduinoIDFsettings(env):
     def get_MD5_hash(phrase):
         import hashlib
         return hashlib.md5((phrase).encode('utf-8')).hexdigest()[:16]
 
-    if flag_custom_sdkonfig == True:
+    def custom_sdkconfig_file(string):
+        if not config.has_option("env:"+env["PIOENV"], "custom_sdkconfig"):
+            return ""
+        sdkconfig_entrys = env.GetProjectOption("custom_sdkconfig").splitlines()
+        for file in sdkconfig_entrys:
+            if "http" in file and "://" in file:
+                response = requests.get(file.split(" ")[0])
+                if response.ok:
+                    target = str(response.content.decode('utf-8'))
+                else:
+                    print("Failed to download:", file)
+                    return ""
+                return target
+            if "file://" in file:
+                file_path = join(PROJECT_DIR,file.lstrip("file://").split(os.path.sep)[-1])
+                if os.path.exists(file_path):
+                    with open(file_path, 'r') as file:
+                        target = file.read()
+                else:
+                    print("File not found:", file_path)
+                    return ""
+                return target
+        return ""
+
+
+    custom_sdk_config_flags = ""
+    board_idf_config_flags = ""
+    sdkconfig_file_flags = ""
+    custom_sdkconfig_file_str = ""
+
+    if config.has_option("env:"+env["PIOENV"], "custom_sdkconfig"):
+        flag_custom_sdkonfig = True
+        custom_sdk_config_flags = (env.GetProjectOption("custom_sdkconfig").rstrip("\n")) + "\n"
+        custom_sdkconfig_file_str = custom_sdkconfig_file(sdkconfig_file_flags)
+
+    if "espidf.custom_sdkconfig" in board:
+        board_idf_config_flags = ('\n'.join([element for element in board.get("espidf.custom_sdkconfig", "")])).rstrip("\n") + "\n"
+        flag_custom_sdkonfig = True
+
+    if flag_custom_sdkonfig == True: # TDOO duplicated
         print("*** Add \"custom_sdkconfig\" settings to IDF sdkconfig.defaults ***")
-        idf_config_flags = env.GetProjectOption("custom_sdkconfig")
+        idf_config_flags = custom_sdk_config_flags
+        if custom_sdkconfig_file_str != "":
+            sdkconfig_file_flags = custom_sdkconfig_file_str + "\n"
+            idf_config_flags = sdkconfig_file_flags + idf_config_flags
+        idf_config_flags = board_idf_config_flags + idf_config_flags
+        if flash_frequency != "80m":
+            idf_config_flags = idf_config_flags + "# CONFIG_ESPTOOLPY_FLASHFREQ_80M is not set\n"
+            esptool_flashfreq_y = "CONFIG_ESPTOOLPY_FLASHFREQ_%s=y\n" % flash_frequency.upper()
+            esptool_flashfreq_M = "CONFIG_ESPTOOLPY_FLASHFREQ=\"%s\"\n" % flash_frequency
+            idf_config_flags = idf_config_flags + esptool_flashfreq_y + esptool_flashfreq_M
+        if flash_mode != "qio":
+            idf_config_flags = idf_config_flags + "# CONFIG_ESPTOOLPY_FLASHMODE_QIO is not set\n"
+        esptool_flashmode = "CONFIG_ESPTOOLPY_FLASHMODE_%s=y\n" % flash_mode.upper()
+        if esptool_flashmode not in idf_config_flags:
+            idf_config_flags = idf_config_flags + esptool_flashmode
         if mcu in ("esp32") and "CONFIG_FREERTOS_UNICORE=y" in idf_config_flags:
-            idf_config_flags = idf_config_flags + "\n# CONFIG_SPIRAM is not set\n"
+            idf_config_flags = idf_config_flags + "# CONFIG_SPIRAM is not set\n"
+
         idf_config_flags = idf_config_flags.splitlines()
         sdkconfig_src = join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"sdkconfig")
 
@@ -150,7 +267,7 @@ def HandleArduinoIDFsettings(env):
         with open(sdkconfig_src) as src:
             sdkconfig_dst = os.path.join(PROJECT_DIR, "sdkconfig.defaults")
             dst = open(sdkconfig_dst,"w")
-            dst.write("# TASMOTA__"+ get_MD5_hash(env.GetProjectOption("custom_sdkconfig").strip() + mcu) +"\n")
+            dst.write("# TASMOTA__"+ get_MD5_hash(''.join(custom_sdk_config_flags).strip() + mcu) +"\n")
             while line := src.readline():
                 flag = get_flag(line)
                 if flag is None:
@@ -158,7 +275,7 @@ def HandleArduinoIDFsettings(env):
                 else:
                     no_match = True
                     for item in idf_config_flags:
-                        if flag in item:
+                        if flag == get_flag(item.replace("\'", "")):
                             dst.write(item.replace("\'", "")+"\n")
                             no_match = False
                             print("Replace:",line,"with:",item.replace("\'", ""))
@@ -173,7 +290,7 @@ def HandleArduinoIDFsettings(env):
     else:
         return
 
-def HandleArduinoCOMPONENTsettings(env):
+def HandleCOMPONENTsettings(env):
     if flag_custom_component_add == True or flag_custom_component_remove == True: # todo remove duplicated
         import yaml
         from yaml import SafeLoader
@@ -186,9 +303,28 @@ def HandleArduinoCOMPONENTsettings(env):
             idf_custom_component_add = env.GetProjectOption("custom_component_add").splitlines()
         else:
             idf_custom_component_add = ""
-        idf_component_yml_src = os.path.join(ARDUINO_FRAMEWORK_DIR, "idf_component.yml")
-        if not bool(os.path.isfile(join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml.orig"))):
+
+        # search "idf_component.yml" file
+        try: # 1.st in Arduino framework
+            idf_component_yml_src = os.path.join(ARDUINO_FRAMEWORK_DIR, "idf_component.yml")
             shutil.copy(join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml"),join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml.orig"))
+            yml_file_dir = idf_component_yml_src
+        except: # 2.nd Project source
+            try:
+                idf_component_yml_src = os.path.join(PROJECT_SRC_DIR, "idf_component.yml")
+                shutil.copy(join(PROJECT_SRC_DIR,"idf_component.yml"),join(PROJECT_SRC_DIR,"idf_component.yml.orig"))
+                yml_file_dir = idf_component_yml_src
+            except: # no idf_component.yml in Project source -> create
+                idf_component_yml_src = os.path.join(PROJECT_SRC_DIR, "idf_component.yml")
+                yml_file_dir = idf_component_yml_src
+                idf_component_yml_str = """
+                    dependencies:
+                      idf: \">=5.1\"
+                """
+                idf_component_yml = yaml.safe_load(idf_component_yml_str)
+                with open(idf_component_yml_src, 'w',) as f :
+                    yaml.dump(idf_component_yml,f) 
+
         yaml_file=open(idf_component_yml_src,"r")
         idf_component=yaml.load(yaml_file, Loader=SafeLoader)
         idf_component_str=json.dumps(idf_component)      # convert to json string
@@ -203,11 +339,20 @@ def HandleArduinoCOMPONENTsettings(env):
 
         if idf_custom_component_add != "":
             for entry in idf_custom_component_add:
-                # add entrys to json
-                print("*** Adding component:",entry)
-                # todo  idf_component_json["dependencies"][entry]
+                if len(str(entry)) > 4: # too short or empty entry
+                    # add new entrys to json
+                    if "@" in entry:
+                        idf_comp_entry = str(entry.split("@")[0]).replace(" ", "")
+                        idf_comp_vers = str(entry.split("@")[1]).replace(" ", "")
+                    else:
+                        idf_comp_entry = str(entry).replace(" ", "")
+                        idf_comp_vers = "*"
+                    if idf_comp_entry not in idf_component_json["dependencies"]:
+                        print("*** Adding component:", idf_comp_entry, idf_comp_vers)
+                        new_entry = {idf_comp_entry: {"version": idf_comp_vers}}
+                        idf_component_json["dependencies"].update(new_entry)
 
-        idf_component_yml_file = open(os.path.join(ARDUINO_FRAMEWORK_DIR, "idf_component.yml"),"w")
+        idf_component_yml_file = open(yml_file_dir,"w")
         yaml.dump(idf_component_json, idf_component_yml_file)
         idf_component_yml_file.close()
         # print("JSON from modified idf_component.yml:")
@@ -216,11 +361,11 @@ def HandleArduinoCOMPONENTsettings(env):
     return
 
 if flag_custom_component_add == True or flag_custom_component_remove == True:
-    HandleArduinoCOMPONENTsettings(env)
+    HandleCOMPONENTsettings(env)
 
-if flag_custom_sdkonfig:
+if flag_custom_sdkonfig == True and "arduino" in env.subst("$PIOFRAMEWORK"):
     HandleArduinoIDFsettings(env)
-    LIB_SOURCE = os.path.join(env.subst("$PROJECT_CORE_DIR"), "platforms", "espressif32", "builder", "build_lib")
+    LIB_SOURCE = os.path.join(ProjectConfig.get_instance().get("platformio", "platforms_dir"), "espressif32", "builder", "build_lib")
     if not bool(os.path.exists(os.path.join(PROJECT_DIR, ".dummy"))):
         shutil.copytree(LIB_SOURCE, os.path.join(PROJECT_DIR, ".dummy"))
     PROJECT_SRC_DIR = os.path.join(PROJECT_DIR, ".dummy")
@@ -1904,8 +2049,13 @@ if os.path.isdir(ulp_dir) and os.listdir(ulp_dir) and mcu not in ("esp32c2", "es
 
 if "arduino" in env.get("PIOFRAMEWORK") and "espidf" not in env.get("PIOFRAMEWORK"):
     def idf_lib_copy(source, target, env):
-        lib_src = join(env["PROJECT_BUILD_DIR"],env["PIOENV"],"esp-idf")
-        lib_dst = join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"lib")
+        env_build = join(env["PROJECT_BUILD_DIR"],env["PIOENV"])
+        sdkconfig_h_path = join(env_build,"config","sdkconfig.h")
+        arduino_libs = join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs")
+        lib_src = join(env_build,"esp-idf")
+        lib_dst = join(arduino_libs,mcu,"lib")
+        ld_dst = join(arduino_libs,mcu,"ld")
+        mem_var = join(arduino_libs,mcu,board.get("build.arduino.memory_type", (board.get("build.flash_mode", "dio") + "_qspi")))
         src = [join(lib_src,x) for x in os.listdir(lib_src)]
         src = [folder for folder in src if not os.path.isfile(folder)] # folders only
         for folder in src:
@@ -1913,10 +2063,21 @@ if "arduino" in env.get("PIOFRAMEWORK") and "espidf" not in env.get("PIOFRAMEWOR
             for file in files:
                 if file.strip().endswith(".a"):
                     shutil.copyfile(file,join(lib_dst,file.split(os.path.sep)[-1]))
-        if not bool(os.path.isfile(join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"sdkconfig.orig"))):
-            shutil.move(join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"sdkconfig"),join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"sdkconfig.orig"))
-        shutil.copyfile(join(env.subst("$PROJECT_DIR"),"sdkconfig."+env["PIOENV"]),join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs",mcu,"sdkconfig"))
-        shutil.copyfile(join(env.subst("$PROJECT_DIR"),"sdkconfig."+env["PIOENV"]),join(ARDUINO_FRAMEWORK_DIR,"tools","esp32-arduino-libs","sdkconfig"))
+
+        shutil.move(join(lib_dst,"libspi_flash.a"),join(mem_var,"libspi_flash.a"))
+        shutil.move(join(env_build,"memory.ld"),join(ld_dst,"memory.ld"))
+        if mcu == "esp32s3":
+            shutil.move(join(lib_dst,"libesp_psram.a"),join(mem_var,"libesp_psram.a"))
+            shutil.move(join(lib_dst,"libesp_system.a"),join(mem_var,"libesp_system.a"))
+            shutil.move(join(lib_dst,"libfreertos.a"),join(mem_var,"libfreertos.a"))
+            shutil.move(join(lib_dst,"libbootloader_support.a"),join(mem_var,"libbootloader_support.a"))
+            shutil.move(join(lib_dst,"libesp_hw_support.a"),join(mem_var,"libesp_hw_support.a"))
+
+        shutil.copyfile(sdkconfig_h_path,join(mem_var,"include","sdkconfig.h"))
+        if not bool(os.path.isfile(join(arduino_libs,mcu,"sdkconfig.orig"))):
+            shutil.move(join(arduino_libs,mcu,"sdkconfig"),join(arduino_libs,mcu,"sdkconfig.orig"))
+        shutil.copyfile(join(env.subst("$PROJECT_DIR"),"sdkconfig."+env["PIOENV"]),join(arduino_libs,mcu,"sdkconfig"))
+        shutil.copyfile(join(env.subst("$PROJECT_DIR"),"sdkconfig."+env["PIOENV"]),join(arduino_libs,"sdkconfig"))
         print("*** Copied compiled %s IDF libraries to Arduino framework ***" % idf_variant)
 
         pio_exe_path = shutil.which("platformio"+(".exe" if IS_WINDOWS else ""))
@@ -1931,10 +2092,29 @@ if "arduino" in env.get("PIOFRAMEWORK") and "espidf" not in env.get("PIOFRAMEWOR
             )
         )
         if flag_custom_component_add == True or flag_custom_component_remove == True:
-            shutil.copy(join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml.orig"),join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml"))
-            print("*** Original Arduino \"idf_component.yml\" restored ***")
+            try:
+                shutil.copy(join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml.orig"),join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml"))
+                print("*** Original Arduino \"idf_component.yml\" restored ***")
+            except:
+                print("*** Original Arduino \"idf_component.yml\" couldnt be restored ***")
     env.AddPostAction("checkprogsize", idf_lib_copy)
 
+if "espidf" in env.get("PIOFRAMEWORK") and (flag_custom_component_add == True or flag_custom_component_remove == True):
+    def idf_custom_component(source, target, env):
+        try:
+            shutil.copy(join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml.orig"),join(ARDUINO_FRAMEWORK_DIR,"idf_component.yml"))
+            print("*** Original Arduino \"idf_component.yml\" restored ***")
+        except:
+            try:
+                shutil.copy(join(PROJECT_SRC_DIR,"idf_component.yml.orig"),join(PROJECT_SRC_DIR,"idf_component.yml"))
+                print("*** Original \"idf_component.yml\" restored ***")
+            except: # no "idf_component.yml" in source folder
+                try:
+                    os.remove(join(PROJECT_SRC_DIR,"idf_component.yml"))
+                    print("*** pioarduino generated \"idf_component.yml\" removed ***")
+                except:
+                    print("*** \"idf_component.yml\" couldnt be removed ***")
+    env.AddPostAction("checkprogsize", idf_custom_component)
 #
 # Process OTA partition and image
 #
