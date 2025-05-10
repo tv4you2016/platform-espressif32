@@ -25,23 +25,12 @@ from platformio.util import get_serial_ports
 env = DefaultEnvironment()
 platform = env.PioPlatform()
 config = env.GetProjectConfig()
-extra_flags = ''.join([element.replace("-D", " ") for element in env.BoardConfig().get("build.extra_flags", "")])
-build_flags = ''.join([element.replace("-D", " ") for element in env.GetProjectOption("build_flags")])
-flag_custom_sdkonfig = False
-if config.has_option("env:"+env["PIOENV"], "custom_sdkconfig"):
-    flag_custom_sdkonfig = True
 
 #
 # Helpers
 #
 
-if "CORE32SOLO1" in extra_flags or "FRAMEWORK_ARDUINO_SOLO1" in build_flags and flag_custom_sdkonfig is False:
-    FRAMEWORK_DIR = platform.get_package_dir("framework-arduino-solo1")
-elif "CORE32ITEAD" in extra_flags or "FRAMEWORK_ARDUINO_ITEAD" in build_flags and flag_custom_sdkonfig is False:
-    FRAMEWORK_DIR = platform.get_package_dir("framework-arduino-ITEAD")
-else:
-    FRAMEWORK_DIR = platform.get_package_dir("framework-arduinoespressif32")
-
+FRAMEWORK_DIR = platform.get_package_dir("framework-arduinoespressif32")
 
 def BeforeUpload(target, source, env):
     upload_options = {}
@@ -143,7 +132,7 @@ def _parse_partitions(env):
 
     result = []
     next_offset = 0
-    app_offset = int(board.get("upload.offset_address", "0x10000"), 16) # default 0x10000
+    app_offset = 0x10000
     with open(partitions_csv) as fp:
         for line in fp.readlines():
             line = line.strip()
@@ -246,7 +235,7 @@ board = env.BoardConfig()
 mcu = board.get("build.mcu", "esp32")
 toolchain_arch = "xtensa-%s" % mcu
 filesystem = board.get("build.filesystem", "littlefs")
-if mcu in ("esp32c2", "esp32c3", "esp32c6", "esp32h2", "esp32p4"):
+if mcu in ("esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32h2", "esp32p4"):
     toolchain_arch = "riscv32-esp"
 
 if "INTEGRATION_EXTRA_DATA" not in env:
@@ -267,7 +256,7 @@ env.Replace(
     GDB=join(
         platform.get_package_dir(
             "tool-riscv32-esp-elf-gdb"
-            if mcu in ("esp32c2", "esp32c3", "esp32c6", "esp32h2", "esp32p4")
+            if mcu in ("esp32c2", "esp32c3", "esp32c5", "esp32c6", "esp32h2", "esp32p4")
             else "tool-xtensa-esp-elf-gdb"
         )
         or "",
@@ -491,28 +480,6 @@ elif upload_protocol == "esptool":
         env.VerboseAction(BeforeUpload, "Looking for upload port..."),
         env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")
     ]
-
-elif upload_protocol == "dfu":
-
-    hwids = board.get("build.hwids", [["0x2341", "0x0070"]])
-    vid = hwids[0][0]
-    pid = hwids[0][1]
-
-    upload_actions = [env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")]
-
-    env.Replace(
-        UPLOADER=join(
-            platform.get_package_dir("tool-dfuutil-arduino") or "", "dfu-util"
-        ),
-        UPLOADERFLAGS=[
-            "-d",
-            ",".join(["%s:%s" % (hwid[0], hwid[1]) for hwid in hwids]),
-            "-Q",
-            "-D"
-        ],
-        UPLOADCMD='"$UPLOADER" $UPLOADERFLAGS "$SOURCE"',
-    )
-
 
 elif upload_protocol in debug_tools:
     _parse_partitions(env)
