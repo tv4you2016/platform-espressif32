@@ -15,7 +15,7 @@ Espressif Systems is a privately held fabless semiconductor company. They provid
 1. [Install PlatformIO](http://platformio.org)
 2. Create PlatformIO project and configure a platform option in [platformio.ini](http://docs.platformio.org/page/projectconf.html) file:
 
-## Tasmota release Arduino 3.1.3.250504 and IDF 5.3.3.250501 (build from development branches)
+## Tasmota release Arduino 3.1.3.250504 and IDF 5.3.3.250501
 Support for the ESP32/ESP32solo1, ESP32C2, ESP32C3, ESP32C6, ESP32S2, ESP32S3 and ESP32-H2              
 ```
 [platformio]
