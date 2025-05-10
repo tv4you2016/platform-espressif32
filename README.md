@@ -7,7 +7,6 @@
 
 Espressif Systems is a privately held fabless semiconductor company. They provide wireless communications chips which are widely used.
 
-* [Home](http://platformio.org/platforms/espressif32) (home page in PlatformIO Platform Registry)
 * [Documentation](http://docs.platformio.org/page/platforms/espressif32.html) (advanced usage, packages, boards, frameworks, etc.)
 
 ### Requirements
